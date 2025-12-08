@@ -1,4 +1,3 @@
-
 # Quant-Net Agent
 
 The QUANT-NET Control Plane (QNCP) runs as a distributed system. This Agent
@@ -40,6 +39,27 @@ Options:
   --help                    Show this message and exit.
 ```
 
+## Hardware driver usage
+
+Some hardware drivers rely on optional, driver‑specific Python packages that are **not** installed by default.
+
+Drivers under `quantnet_agent/hal/driver` currently requiring extra dependencies are:
+
+- `artiq.py` → `sipyco` `python-usbtmc`
+- `Thorlabs.py` → `ThorlabsPM100`
+
+All such optional development/driver dependencies are listed in `requirements-dev.txt`. To install them all at once:
+
+```bash
+pip install -r requirements-dev.txt
+```
+
+If you only need a specific driver, install just its package(s), for example:
+
+```bash
+pip install sipyco ThorlabsPM100 python-usbtmc
+```
+
 ## Example usage
 
 An MQTT broker should be available for the agent to connect to. A development docker-compose file that starts an Eclipse Mosquitto instance is available in `quant-net-docker:docker-compose-backend.yml`
@@ -50,8 +70,3 @@ Running the agent:
 
 ```
 quantnet_agent --mq-broker-host <broker> -n <path_to>/quant-net-mq/quantnet_mq/schema/examples/conf_qnode.json
-```
-
-
-
-
