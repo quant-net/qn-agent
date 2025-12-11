@@ -9,12 +9,17 @@ RUN apt-get update && \
 # Update pip
 RUN pip install --upgrade pip setuptools wheel
 
+# Declare ARG without default - REQUIRED even without default value
+ARG BRANCH
+
+RUN echo "Dockerfile BRANCH value is: ${BRANCH}"
+
 RUN git clone --single-branch --branch main https://github.com/quant-net/qn-mq qn-mq && \
     cd qn-mq && pip install --no-cache-dir .
 
 RUN git clone --single-branch --branch main https://github.com/quant-net/qn-plugins qn-plugins
 
-RUN  git clone --single-branch --branch main https://github.com/quant-net/qn-agent qn-agent && \
+RUN  git clone --single-branch --branch ${BRANCH} https://github.com/quant-net/qn-agent qn-agent && \
     cd qn-agent && pip install --no-cache-dir .
 
 

@@ -15,7 +15,9 @@ jobs:
     steps:
       - name: Checkout repository code
         uses: actions/checkout@v4
-
+        with:
+          ref: main
+          
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
