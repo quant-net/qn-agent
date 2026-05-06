@@ -20,6 +20,18 @@ Pull requirements and install package in edit mode.
 pip3 install -e .
 ```
 
+Hardware-specific drivers for ARTIQ and Thorlabs devices are optional dependencies not included in the default install. To use these drivers, install the dev requirements first:
+
+```
+pip3 install -r requirements-dev.txt
+pip3 install -e .
+```
+
+| Package | Purpose |
+|---------|---------|
+| `sipyco` | ARTIQ experiment framework client (`ArtiqClient` HAL driver) |
+| `ThorlabsPM100` | Thorlabs power meter driver (`Thorlabs` HAL driver) |
+
 The `quantnet_agent` script will be available in your local path, or check `~/.local/bin`
 
 ```

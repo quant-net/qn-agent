@@ -1,0 +1,2 @@
+sipyco @ git+https://github.com/m-labs/sipyco.git@v1.4
+ThorlabsPM100
