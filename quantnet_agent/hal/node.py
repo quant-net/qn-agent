@@ -74,7 +74,7 @@ class Node(ABC):
         for task in self.tasks:
             ns = "task"
             name = task["Name"]
-            path = Constants.DEFAULT_TASK_PATH
+            path = task.get("_path", "")
             ret += f"{name:<30}{ns:<30}{path}\n"
         return ret.strip()
 

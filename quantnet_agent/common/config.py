@@ -2,26 +2,29 @@ import os
 import logging
 import configobj
 import json
+import sys
 from quantnet_agent.common.constants import Constants
 
 log = logging.getLogger(__name__)
 
 
-def get_config(config_file):
+def find_config_file(config_file):
     config_files = []
     if config_file:
-        config_files.append(config_file)
+        if not os.path.exists(config_file):
+            log.error(f"Specified configuration file '{config_file}' does not exist.")
+            sys.exit(3)
+        return config_file
+
     if "QUANTNET_HOME" in os.environ:
         config_files.append(f"{os.environ['QUANTNET_HOME']}/etc/agent.cfg")
     else:
         config_files.append("/etc/quantnet/agent.cfg")
 
     for cf in config_files:
-        try:
-            config = configobj.ConfigObj(cf)
-        except IOError:
-            continue
-    return config
+        if os.path.exists(cf):
+            return cf
+    return None
 
 
 class Config:
@@ -36,73 +39,46 @@ class Config:
         interpreter_path: str = None,
         schema_path: str = None,
     ):
-        self._config = None
-        self.devices = {}
+        self.config_file = find_config_file(config_file)
 
-        self._config = get_config(config_file)
-
-        if not self._config:
-            log.warning("No configuration file found, continuing with defaults")
-
-        if node_file:
-            self.node_file = node_file
-        else:
-            self.node_file = self.config_get("agent", "node_file", raise_exception=False)
-
-        if mq_broker_host:
-            self.mq_broker_host = mq_broker_host
-        else:
-            self.mq_broker_host = self.config_get("mq", "host", default="127.0.0.1")
-
-        if mq_broker_port:
-            self.mq_broker_port = mq_broker_port
-        else:
-            self.mq_broker_port = self.config_get("mq", "port", default="1883")
-
-        self.threads = int(self.config_get("agent", "threads", default=8))
-
-        if debug:
-            self.debug = debug
-        else:
-            self.config_get("agent", "debug", default=False)
-
-        if agent_id:
-            self.cid = agent_id
-        else:
+        self._parser = {}
+        if self.config_file:
             try:
-                self.cid = self.config_get("agent", "agent_id")
-            except Exception:
-                self.cid = None
+                self._parser = configobj.ConfigObj(self.config_file)
+            except IOError:
+                pass
 
-        if interpreter_path:
-            self.interpreter_path = interpreter_path
-        else:
-            self.interpreter_path = self.config_get("interpreters", "path", raise_exception=False)
+        self.node_file = self._resolve(node_file, "agent", "node_file", None)
+        self.mq_broker_host = self._resolve(mq_broker_host, "mq", "host", "127.0.0.1")
+        self.mq_broker_port = self._resolve(mq_broker_port, "mq", "port", "1883")
 
-        if "protocols" in self._config and len(self._config["protocols"]) > 0:
+        self.threads = int(self._resolve(None, "agent", "threads", 8))
+        self.debug = self._resolve(debug if debug else None, "agent", "debug", False)
+
+        self.cid = self._resolve(agent_id, "agent", "agent_id", None)
+        self.interpreter_path = self._resolve(interpreter_path, "interpreters", "path", None)
+
+        if self._parser and "protocols" in self._parser and len(self._parser["protocols"]) > 0:
             if self.interpreter_path is None:
                 raise Exception("Interpreter location for protocols is not found")
-            self.proto_plugins = self._config["protocols"]
+            self.proto_plugins = self._parser["protocols"]
         else:
             self.proto_plugins = {}
 
-        if schema_path:
-            self.schema_path = schema_path
-        else:
-            self.schema_path = self.config_get("schemas", "path", raise_exception=False)
+        self.schema_path = self._resolve(schema_path, "schemas", "path", None)
 
-        if "devices" in self._config:
-            self.devices = self._config["devices"]
+        self.devices = self._parser.get("devices", {}) if self._parser else {}
 
         self.tasks = []
         self.task_properties = {}
 
-        if "tasks" in self._config:
-            for task, property in self._config["tasks"].items():
+        if self._parser and "tasks" in self._parser:
+            for task, property in self._parser["tasks"].items():
                 try:
                     if type(property) is configobj.Section:
-                        with open(os.path.join(Constants.DEFAULT_TASK_PATH, property["path"]), "r") as file:
+                        with open(property["path"], "r") as file:
                             calibration_task = json.load(file)
+                            calibration_task["_path"] = property["path"]
                             if float(calibration_task["Periodicity"]) <= Constants.SLOTSIZE.total_seconds():
                                 raise Exception(
                                     f"Task {task} interval is too short."
@@ -115,21 +91,15 @@ class Config:
                 except Exception as e:
                     log.error(f"Cannot load local task {task} : {e}")
 
-    def config_get(self, section, option, raise_exception=True, default=None, check_config_table=True):
-        """
-        Return the string value for a given option in a section
-
-        :param section: the named section.
-        :param option: the named option.
-        :param raise_exception: Boolean to raise or not NoOptionError or NoSectionError.
-        :param default: the default value if not found.
-        :param check_config_table: if not set, avoid looking at config table
-        .
-        :returns: the configuration value.
-        """
-        try:
-            return self._config[section][option]
-        except (configobj.ConfigObjError, KeyError) as err:
-            if raise_exception and default is None:
-                raise err
+    def _resolve(self, cli_val, section, option, default):
+        if cli_val is not None:
+            return cli_val
+        if not self._parser:
             return default
+        try:
+            return self._parser[section][option]
+        except (configobj.ConfigObjError, KeyError):
+            return default
+
+    def get(self, section, option, default=None, **kwargs):
+        return self._resolve(None, section, option, default)

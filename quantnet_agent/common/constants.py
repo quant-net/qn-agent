@@ -4,7 +4,6 @@ import quantnet_agent
 
 
 class Constants:
-    DEFAULT_CONFIG_FILE = "./config/agent.cfg"
     DEFAULT_NODE_CONFIG_FILE = "./config/conf-alice.json"
     DEFAULT_LOGGING_CONFIG_FILE = "./config/logging.conf"
     DEFAULT_INTERPRETERS = {
@@ -12,7 +11,6 @@ class Constants:
         "calibration": "calibration.py",
         "experiment": "exp_framework.py",
     }
-    DEFAULT_TASK_PATH = os.path.join(os.path.dirname(os.path.dirname(quantnet_agent.__file__)), "config/")
     DEFAULT_TASK_INTERPRETER = os.path.join(
         os.path.dirname(quantnet_agent.__file__), "hal/interpreter/calibration_interpreter.py"
     )

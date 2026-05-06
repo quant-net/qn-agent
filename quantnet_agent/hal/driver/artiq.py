@@ -2,7 +2,6 @@ import logging
 from sipyco.pc_rpc import Client
 from sipyco.broadcast import Receiver
 from quantnet_agent.hal.hwclasses import ExpFramework
-import time
 import asyncio
 import numpy
 
@@ -16,16 +15,17 @@ class ArtiqClient(ExpFramework):
         self.logs = {}
         if "version" in property and int(property["version"]) == 7:
             self.schedule, self.exps, self.datasets = [
-            Client(property["host"], property["port"], i) for i in "master_schedule master_experiment_db master_dataset_db".split()
-        ]
+                Client(property["host"], property["port"], i)
+                for i in "master_schedule master_experiment_db master_dataset_db".split()
+            ]
         else:
             self.schedule, self.exps, self.datasets = [
                 Client(property["host"], property["port"], i) for i in "schedule experiment_db dataset_db".split()
             ]
 
-        asyncio.create_task(self._connect_and_receive_logs(property["host"], int(property["logging"])))
+        asyncio.create_task(self._connect_and_receive_logs(property["host"], int(property["port"])))
 
-        log.info(f"Initializing ARTIQ with {property['host']} : {property['logging']}")
+        log.info(f"Initializing ARTIQ with {property['host']} : {property['port']}")
 
     async def _connect_and_receive_logs(self, host, port):
         # Create the receiver instance
@@ -44,10 +44,10 @@ class ArtiqClient(ExpFramework):
     def _append_message(self, msg):
         log.debug(f"Received a message from artiq: {msg}")
         try:
-            if msg[1] == 'master':
+            if msg[1] == "master":
                 rid = "master"
             else:
-                rid = int(msg[1][msg[1].find("(") + 1: msg[1].find(",")])
+                rid = int(msg[1][msg[1].find("(") + 1 : msg[1].find(",")])
 
             if rid not in self.logs:
                 self.logs[rid] = ""
@@ -75,7 +75,7 @@ class ArtiqClient(ExpFramework):
         pass
 
     async def receive(self, *args, **kwargs):
-        exp_id = args[0]        
+        exp_id = args[0]
         rid = self.expid_to_rid[exp_id]
         await self._wait_for_completion(rid)
         if len(args) > 1:
@@ -86,7 +86,7 @@ class ArtiqClient(ExpFramework):
                     result = self.datasets.get(param)
                     if type(result) == numpy.ndarray:
                         result = result.tolist()
-                    results[param] = result 
+                    results[param] = result
                 return {f"status for rid {rid}": "done", "results": results}
             except Exception as e:
                 logging.error(f"Failed to get result for exp {exp_id}: {e}")
@@ -95,7 +95,7 @@ class ArtiqClient(ExpFramework):
             return {f"status for rid {rid}": "done"}
 
     async def submit(self, exp_id, expName, classname, args=dict()):
-        args['use_db'] = True
+        args["use_db"] = True
         expid = dict(
             file=expName,
             class_name=classname,

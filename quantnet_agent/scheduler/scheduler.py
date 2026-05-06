@@ -103,13 +103,13 @@ class AgentScheduler:
         result = await allocation.result_handler(
                             allocation.exp_id, allocation.checking_param
                         )
-        v = {"name": allocation.name}
+        v = {"name": allocation.name, "exp_id": allocation.exp_id}
         if "results" in result:
             v["result"] = result["results"]
             msg = monitor.MonitorEvent(
                 rid=self.cid,
                 ts=datetime.now(timezone.utc).timestamp(),
-                eventType="experimentResult",
+                eventType="agentTaskResult",
                 value=v,
             )
             await self.msgclient.publish("monitor", msg.as_dict())
@@ -187,7 +187,8 @@ class AgentScheduler:
     def schedule_allocations(self, allocation):
         next_allocation = allocation.last_allocation + int(allocation.interval / Constants.SLOTSIZE)
         while next_allocation[-1] < len(self.timeslots):
-            self.schedule_next_allocation(allocation, next_allocation)
+            if not self.schedule_next_allocation(allocation, next_allocation):
+                break
             next_allocation = allocation.last_allocation + int(allocation.interval / Constants.SLOTSIZE)
 
     def schedule_next_allocation(self, allocation, indices):
@@ -197,8 +198,9 @@ class AgentScheduler:
             indices = self._get_free_slots(indices)
             if indices is None:
                 log.warning("Cannot find an empty slot for a task within current time window")
-                return
+                return False
         self._allocate(allocation, indices)
+        return True
 
     async def update_schedule(self):
         async with self.lock:

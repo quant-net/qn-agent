@@ -7,5 +7,6 @@ repos:
       language: system
       types: [python]
       args: [
-        --max-line-length=120
+        --max-line-length=120,
+        --extend-ignore=E203
       ]
