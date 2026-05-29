@@ -1,7 +1,6 @@
 import logging
 import math
 import asyncio
-from collections import deque
 from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.date import DateTrigger
@@ -16,8 +15,6 @@ from quantnet_mq.schema.models import monitor
 
 
 log = logging.getLogger(__name__)
-logging.getLogger("apscheduler").setLevel(logging.CRITICAL)
-logging.getLogger().setLevel(logging.DEBUG)
 
 
 class Allocation:
@@ -29,10 +26,10 @@ class Allocation:
         duration: timedelta,
         interval: timedelta = None,
         exp_id=None,
-        parameters=[],
+        parameters=None,
         result_handler=None,
         status=None,
-        checking_param=[],
+        checking_param=None,
     ):
         self.name = name
         self.operation = operation
@@ -41,12 +38,13 @@ class Allocation:
         self.interval = interval
         self.last_allocation = None
         self.last_exec = None
-        self.parameters = parameters
+        self.parameters = parameters if parameters is not None else []
         self.exp_id = exp_id
         self.result_handler = result_handler
         self.status = status
-        self.checking_param = checking_param
+        self.checking_param = checking_param if checking_param is not None else []
         self.job_ids = []
+        self._slot_indices: set = set()
 
     def __str__(self):
         return self.name
@@ -54,11 +52,15 @@ class Allocation:
 
 class AgentScheduler:
     def __init__(self, cid, msgclient):
+        logging.getLogger("apscheduler").setLevel(logging.CRITICAL)
         self._scheduler = AsyncIOScheduler()
         self.base = None
         self.timeslots = [None] * Constants.MAX_TIMESLOTS
         self.local_allocations = []
         self.remote_allocations = []
+        # O(1) lookups — maintained in sync with the two lists above
+        self._alloc_by_name: dict = {}    # name  -> Allocation
+        self._alloc_by_job_id: dict = {}  # job_id -> Allocation
         self.lock = asyncio.Lock()
         self.is_started = False
         self.cmd_handler = {}
@@ -66,43 +68,33 @@ class AgentScheduler:
         self.msgclient = msgclient
 
         def job_listener(event):
-            """Listener for job events to handle updates to remote allocations."""
-            job_id = event.job_id
-            matching_remote_allocation = next(
-                (alloc for alloc in self.remote_allocations if job_id in alloc.job_ids), None
-            )
-            matching_local_allocation = next(
-                (alloc for alloc in self.local_allocations if job_id in alloc.job_ids), None
-            )
-            if matching_remote_allocation:
-                if event.exception:
-                    log.error(f"Job {job_id} for allocation {matching_remote_allocation.name} failed.")
-                else:
-                    log.debug(f"Job {job_id} for allocation {matching_remote_allocation.name} executed successfully.")
-            elif matching_local_allocation:
-                if event.exception:
-                    log.error(f"Job {job_id} for allocation {matching_local_allocation.name} failed.")
-                else:
-                    log.debug(f"Job {job_id} for allocation {matching_local_allocation.name} executed successfully.")
-                    if matching_local_allocation.status == Calibration_status.FULL:
-                        # TODO: wait for it to finish and do half or full calibration based on the check
-                        asyncio.create_task(self.publish_result(matching_local_allocation))
+            # Fires on EVENT_JOB_EXECUTED and EVENT_JOB_ERROR for both local and remote jobs.
+            allocation = self._alloc_by_job_id.get(event.job_id)
+            if allocation is None:
+                return
+            if event.exception:
+                log.error(f"Job {event.job_id} for allocation {allocation.name} failed.")
+            else:
+                log.debug(f"Job {event.job_id} for allocation {allocation.name} executed successfully.")
+                # TODO: wait for result, then decide between LIGHT and FULL re-calibration based on the check.
+                # Only publish results for local FULL calibrations; remote results are fetched on demand.
+                if allocation in self.local_allocations and allocation.status == Calibration_status.FULL:
+                    asyncio.create_task(self.publish_result(allocation))
 
         def missing_job_listener(event):
-            job_id = event.job_id
-            matching_allocation = next((alloc for alloc in self.local_allocations if job_id in alloc.job_ids), None)
-            if matching_allocation:
-                log.error(f"Job {job_id} for allocation {matching_allocation.name} missed. Reallocating now")
-                asyncio.create_task(self._handle_missed_allocation(matching_allocation))
+            # APScheduler fires EVENT_JOB_MISSED when a job's run_date passes without execution
+            # (e.g. the scheduler was paused or overloaded). Reschedule local tasks only —
+            # remote experiments are managed by the caller and not retried automatically.
+            allocation = self._alloc_by_job_id.get(event.job_id)
+            if allocation is not None and allocation in self.local_allocations:
+                log.error(f"Job {event.job_id} for allocation {allocation.name} missed. Reallocating now")
+                asyncio.create_task(self._handle_missed_allocation(allocation))
 
         self._scheduler.add_listener(job_listener, EVENT_JOB_EXECUTED | EVENT_JOB_ERROR)
         self._scheduler.add_listener(missing_job_listener, EVENT_JOB_MISSED)
 
     async def publish_result(self, allocation):
-
-        result = await allocation.result_handler(
-                            allocation.exp_id, allocation.checking_param
-                        )
+        result = await allocation.result_handler(allocation.exp_id, allocation.checking_param)
         v = {"name": allocation.name, "exp_id": allocation.exp_id}
         if "results" in result:
             v["result"] = result["results"]
@@ -115,7 +107,6 @@ class AgentScheduler:
             await self.msgclient.publish("monitor", msg.as_dict())
 
     async def _handle_missed_allocation(self, allocation):
-        """Handle missed allocation by reacquiring the lock and running it immediately."""
         async with self.lock:
             await self.run_immediately(allocation)
 
@@ -131,13 +122,11 @@ class AgentScheduler:
         self.is_started = False
 
     def get_jobs(self):
-        jobs = self._scheduler.get_jobs()
-        return jobs
+        return self._scheduler.get_jobs()
 
     async def get_free_timeslot(self, start_time: datetime, num_slots: int):
         def convert_to_bitmask(lst):
-            mask = hex(int("".join(["1" if x is None else "0" for x in lst]), 2))
-            return mask
+            return hex(int("".join(["1" if x is None else "0" for x in lst]), 2))
 
         log.info(
             f"\nGetting free timeslot from {start_time} for {num_slots} slots."
@@ -152,24 +141,22 @@ class AgentScheduler:
             log.error("Free Timeslot request is too further ahead from current time slots")
             return {"code": Code.INVALID_ARGUMENT, "value": "Free Timeslot request is larger than current time slot"}
 
-        indices_to_return = [
-            start_time_base,
-            start_time_base + num_slots,
-        ]
-        slots = self.timeslots[indices_to_return[0]: indices_to_return[1]]
-        log.info(f"Reporting free timeslots {indices_to_return}")
-        mask = convert_to_bitmask(slots)
-        return {"code": Code.OK, "value": mask}
+        slots = self.timeslots[start_time_base: start_time_base + num_slots]
+        log.info(f"Reporting free timeslots [{start_time_base}, {start_time_base + num_slots}]")
+        return {"code": Code.OK, "value": convert_to_bitmask(slots)}
 
     async def delete_allocation(self, allocation):
         log.debug(f"Deleting allocation {allocation.name}")
         for job_id in allocation.job_ids:
-            for i in self._scheduler.get_jobs():
-                if i.id == job_id:
-                    self._scheduler.remove_job(job_id)
-        for index in range(len(self.timeslots)):
-            if self.timeslots[index] == allocation:
+            try:
+                self._scheduler.remove_job(job_id)
+            except JobLookupError:
+                pass
+            self._alloc_by_job_id.pop(job_id, None)
+        for index in allocation._slot_indices:
+            if index < len(self.timeslots) and self.timeslots[index] is allocation:
                 self.timeslots[index] = None
+        allocation._slot_indices.clear()
         allocation.job_ids = []
         allocation.last_allocation = None
 
@@ -177,6 +164,8 @@ class AgentScheduler:
         log.debug(f"Running {allocation.name} immediately")
         await self.delete_allocation(allocation)
         basetime_diff = math.ceil((datetime.now(timezone.utc) - self.base) / Constants.SLOTSIZE)
+        # Set last_allocation one full interval before now so that schedule_allocations()
+        # computes next_allocation = last + interval ≈ now and books the first run immediately.
         allocation.last_allocation = (
             np.arange(0, math.ceil(allocation.duration / Constants.SLOTSIZE))
             - int(allocation.interval / Constants.SLOTSIZE)
@@ -193,7 +182,6 @@ class AgentScheduler:
 
     def schedule_next_allocation(self, allocation, indices):
         log.debug(f"New indices for allocation={allocation} is {indices}")
-
         if not self._are_slots_empty(indices):
             indices = self._get_free_slots(indices)
             if indices is None:
@@ -205,34 +193,34 @@ class AgentScheduler:
     async def update_schedule(self):
         async with self.lock:
             new_base = datetime.now(timezone.utc)
-            timeslot_diff = (new_base - self.base) / Constants.SLOTSIZE
-            new_timeslots = deque(self.timeslots)
+            shift = int((new_base - self.base) / Constants.SLOTSIZE)
 
-            # Drops past timeslots and add new ones
-            for _ in range(int(timeslot_diff)):
-                new_timeslots.popleft()
-                new_timeslots.extend([None])
-            self.timeslots = list(new_timeslots)
-            self.base += int(timeslot_diff) * Constants.SLOTSIZE
-            log.debug(f"Shifted timeslot by {int(timeslot_diff)}")
+            if shift > 0:
+                self.timeslots = self.timeslots[shift:] + [None] * shift
+                self.base += shift * Constants.SLOTSIZE
+                log.debug(f"Shifted timeslot by {shift}")
 
-            # Allocate jobs for existing recurring tasks to the new timeslots
+                # Adjust tracked slot indices for all allocations
+                for allocation in self.local_allocations + self.remote_allocations:
+                    allocation._slot_indices = {
+                        idx - shift for idx in allocation._slot_indices if idx >= shift
+                    }
+
             for allocation in self.local_allocations:
                 if allocation.last_allocation is None:
-                    # This is the first allocation
+                    # First time this allocation is being scheduled.
                     await self.run_immediately(allocation)
                 else:
-                    # Update timeslot index for next allocations
                     log.debug(f"last timeslot = {allocation.last_allocation}")
-                    # allocation.last_allocation = [x - int(timeslot_diff) for x in allocation.last_allocation]
-                    allocation.last_allocation -= int(timeslot_diff)
+                    allocation.last_allocation -= shift
                     log.debug(f"updated last timeslot = {allocation.last_allocation}")
 
-                    # Next run is still far head from the current window
+                    # Next run is still beyond the current window — nothing to schedule yet.
                     if allocation.last_allocation[0] > len(self.timeslots):
                         continue
 
-                    # If the next run is in the past, run it immediately
+                    # Next run fell into the past — run it now and let schedule_allocations
+                    # fill in the following intervals.
                     if (allocation.last_allocation + int(allocation.interval / Constants.SLOTSIZE))[0] < 0:
                         await self.run_immediately(allocation)
                         continue
@@ -261,9 +249,9 @@ class AgentScheduler:
             await pub_job
 
         log.debug(f"Trying to allocate {allocation.name} to {indices}")
-
         for index in indices:
             self.timeslots[index] = allocation
+            allocation._slot_indices.add(index)
         start_time = self.base + (indices[0] * Constants.SLOTSIZE)
         trigger = DateTrigger(run_date=start_time)
         job = self._scheduler.add_job(run_and_update, args=[allocation, start_time], trigger=trigger)
@@ -272,14 +260,14 @@ class AgentScheduler:
             f"start_time={start_time}, now = {datetime.now(timezone.utc)}"
         )
         allocation.job_ids.append(job.id)
+        self._alloc_by_job_id[job.id] = allocation
         allocation.last_allocation = indices
 
     def _get_free_slots(self, indices):
         while indices[-1] < Constants.MAX_TIMESLOTS:
             if self._are_slots_empty(indices):
                 return indices
-            else:
-                indices += 1
+            indices += 1
         return None
 
     def _are_slots_empty(self, indices):
@@ -289,7 +277,6 @@ class AgentScheduler:
         return True
 
     def _get_timeslot_indices(self, start_time: datetime, duration: timedelta, interval: timedelta):
-        # Calculate how many iterations and their timeslot indices within current scheduable timeslots
         indices = []
         time_remaining = self.base + (Constants.MAX_TIMESLOTS * Constants.SLOTSIZE) - (start_time + duration)
         log.debug(
@@ -305,21 +292,22 @@ class AgentScheduler:
         return indices
 
     def _get_timeslot_index(self, start_time, duration):
-        log.debug(f"Looking for timeslots starting {start_time} for {duration}")
-        start_index = int((start_time - self.base) / Constants.SLOTSIZE)
         num_slots = math.ceil(duration / Constants.SLOTSIZE)
-        if start_index + num_slots >= Constants.MAX_TIMESLOTS:
-            return None
-        indices = [start_index + i for i in range(num_slots)]
-        if self._are_slots_empty(indices):
-            log.debug(f"Found empty slots: {indices}")
-            return indices
-        else:
-            # If timeslot is already occupied, find next available timeslots
+        current_time = start_time
+        while True:
+            log.debug(f"Looking for timeslots starting {current_time} for {duration}")
+            start_index = int((current_time - self.base) / Constants.SLOTSIZE)
+            if start_index + num_slots >= Constants.MAX_TIMESLOTS:
+                return None
+            indices = list(range(start_index, start_index + num_slots))
+            if self._are_slots_empty(indices):
+                log.debug(f"Found empty slots: {indices}")
+                return indices
             log.debug(
-                f"Slots {indices} are already occupied." f"finding next available slots from {start_time + duration}"
+                f"Slots {indices} are already occupied. "
+                f"Finding next available slots from {current_time + duration}"
             )
-            return self._get_timeslot_index(start_time + duration, duration)
+            current_time += duration
 
     async def preallocate(self, allocation: Allocation):
         if allocation in self.local_allocations:
@@ -329,9 +317,9 @@ class AgentScheduler:
                 f"Allocation {allocation.name} interval is too short (compared to the schedulers timeslot size)"
             )
         self.local_allocations.append(allocation)
+        self._alloc_by_name[allocation.name] = allocation
         async with self.lock:
             await self.run_immediately(allocation)
-        # await self.show_schedule()
 
     def get_status(self):
         return self._scheduler.running
@@ -353,16 +341,14 @@ class AgentScheduler:
             elif base_diff > len(self.timeslots):
                 log.error("Allocation request is too far into the future")
                 return response_obj(expid=exp_id, status=Status(code=6, value=Code(6).name))
+
             for allocation in request.payload.allocations:
                 timeslot_indices = [i + base_diff for i in allocation.timeSlot]
-
                 if not self._are_slots_empty(timeslot_indices):
                     log.error(f"Cannot allocate experiment {exp_id}. Slots are already occupied")
                     return response_obj(expid=exp_id, status=Status(code=6, value=Code(6).name))
 
                 start_time = self.base + (timeslot_indices[0] * Constants.SLOTSIZE)
-
-                # Allocating experiment to the timeslots
                 allocation_obj = Allocation(
                     allocation.expName._value,
                     submit_task,
@@ -374,7 +360,9 @@ class AgentScheduler:
                 )
                 self._allocate(allocation_obj, timeslot_indices)
                 self.remote_allocations.append(allocation_obj)
+                self._alloc_by_name[allocation_obj.name] = allocation_obj
                 self.show_schedule()
+
             return response_obj(expid=exp_id, status=Status(code=0, value=Code(0).name))
 
     async def handle_update_result(self, request):
@@ -384,7 +372,6 @@ class AgentScheduler:
         exp_id = request.payload.expid._value
 
         matching_allocation = next((alloc for alloc in self.remote_allocations if alloc.exp_id == exp_id), None)
-
         if not matching_allocation:
             log.error(f"No allocation found for exp_id {exp_id}")
             return response_obj(
@@ -394,10 +381,8 @@ class AgentScheduler:
         while matching_allocation.last_exec is None:
             await asyncio.sleep(0.1)
 
-        # Handle the result retrieval for the matching allocation
         log.debug(f"Processing result for allocation with exp_id {exp_id}")
         try:
-            # Call the result handler with the matching allocation
             result = await getResult_task(exp_id)
             return response_obj(status=Status(code=Code.OK, value=Code.OK.name), result=result)
         except Exception as e:
@@ -412,13 +397,11 @@ class AgentScheduler:
         response_obj = self.cmd_handler[request.cmd][2]
         try:
             async with self.lock:
-                for experiment in self.remote_allocations:
-                    if experiment.exp_id == exp_id:
-                        for job_id in experiment.job_ids:
-                            self._scheduler.remove_job(job_id)
-                        for index in range(len(self.timeslots)):
-                            if self.timeslots[index] == exp_id:
-                                self.timeslots[index] = None
+                to_cancel = [a for a in self.remote_allocations if a.exp_id == exp_id]
+                for allocation in to_cancel:
+                    await self.delete_allocation(allocation)
+                    self._alloc_by_name.pop(allocation.name, None)
+                self.remote_allocations = [a for a in self.remote_allocations if a.exp_id != exp_id]
             return response_obj(status=Status(code=0, value=Code(0).name))
         except JobLookupError:
             return response_obj(status=Status(code=0, value=Code(0).name))
@@ -427,27 +410,14 @@ class AgentScheduler:
             return response_obj(status=Status(code=6, value=Code(6).name))
 
     def get_allocation(self, task_name):
-        """
-        Retrieves the allocation for a given task name from local or remote allocations.
-        :param task_name: The name of the task to find the allocation for.
-        :return: The Allocation object if found, else None.
-        """
-        # Search in local allocations
-        for allocation in self.local_allocations:
-            if allocation.name == task_name:
-                return allocation
-
-        # Search in remote allocations
-        for allocation in self.remote_allocations:
-            if allocation.name == task_name:
-                return allocation
-
-        # If not found, return None
-        log.warning(f"No allocation found for task {task_name}.")
-        return None
+        allocation = self._alloc_by_name.get(task_name)
+        if allocation is None:
+            log.warning(f"No allocation found for task {task_name}.")
+        return allocation
 
     def register_command(self, ns, interpreter, rpcserver):
-        # NOTE: Scheduleable method in interpreter is handled by method with name handle_{method_name}
+        # Each schedulable command is dispatched to a method named handle_<function_name>
+        # on this class (e.g. experiment.submit → handle_submit).
         for cmd, interpreter_map in interpreter.get_schedulable_commands().items():
             self.cmd_handler[cmd] = interpreter_map
             target_handler = getattr(self, f"handle_{interpreter_map[0].__name__}")
@@ -460,7 +430,6 @@ class AgentScheduler:
         log.debug("Current schedule summary")
         schedule_output = "\n-------------------------------------------------\n["
 
-        # Build the timeslot display line
         for i in range(len(self.timeslots)):
             if self.timeslots[i] is not None:
                 occupied_slots[i] = self.timeslots[i].name
@@ -474,12 +443,10 @@ class AgentScheduler:
         schedule_output += "]\n-------------------------------------------------\n"
         log.debug(schedule_output)
 
-        # Log allocations for local tasks
         for alloc in self.local_allocations:
             slots = [str(i) for i, v in occupied_slots.items() if v == alloc.name]
             log.debug(f"{alloc.name} is allocated at indices\n[{', '.join(slots)}]\n")
 
-        # Log allocations for remote tasks
         for alloc in self.remote_allocations:
             slots = [str(i) for i, v in occupied_slots.items() if v == alloc.name]
             log.debug(f"{alloc.name} is allocated at indices\n[{', '.join(slots)}]\n")
