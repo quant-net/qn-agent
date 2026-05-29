@@ -108,46 +108,48 @@ class LocalTaskManager:
         await self._msgclient.publish("monitor", msg.as_dict())
 
     async def check_state(self):
-        async def set_treenode_status(nodes):
-            for node in nodes:
-                current_state = self.G.nodes[node]["state"]
-                if current_state is not NodeState.out_of_spec and node != 0:
-                    self.G.nodes[node]["state"] = NodeState.partial_out_of_spec
-                else:
-                    self.G.nodes[node]["state"] = NodeState.out_of_spec
-
         now = datetime.now(timezone.utc)
-        # Loop through all nodes except the root (node 0)
-        bfs = nx.bfs_tree(self.G, 0)
-        for node in bfs:
+        topo_order = kahn_topological_sort(self.G)
+
+        # --- Pass 1: evaluate each node's state top-down ---
+        # Walking in topological order means every parent is evaluated before
+        # its children, so a failed parent automatically blocks descendants.
+        for node in topo_order:
             node_data = self.G.nodes[node]
+
             if node == 0:
-                self.G.nodes[node]["state"] = NodeState.in_spec
+                node_data["state"] = NodeState.in_spec
                 if "prev_state" not in node_data:
                     node_data["prev_state"] = NodeState.out_of_spec
-                # await self.report_status("agentTaskSchedulerPhase", "Inspecting the root node")
                 await asyncio.sleep(self.delay)
-                continue  # Skip the root node
+                continue
 
-            # Extract task information from the node
+            # If any direct predecessor is not in_spec, inherit that failure.
+            if any(
+                self.G.nodes[p]["state"] is not NodeState.in_spec
+                for p in self.G.predecessors(node)
+            ):
+                node_data["state"] = NodeState.out_of_spec
+                continue
+
             task_name = node_data["Name"]
-            await self.report_status("agentTaskSchedulerPhase", {"dag_traversal": "inspect",
-                                                                 "task_name": task_name,
-                                                                 "state": node_data["state"].value})
+            await self.report_status("agentTaskSchedulerPhase", {
+                "dag_traversal": "inspect",
+                "task_name": task_name,
+                "state": node_data["state"].value,
+            })
 
-            # Check the task's allocation time from the scheduler
             allocation = self._scheduler.get_allocation(task_name)
 
             if allocation is not None and allocation.last_exec is not None:
                 last_execution = allocation.last_exec[0]
-
                 if last_execution + allocation.interval > now:
-                    log.debug(f"task {allocation.name} is done within its interval {allocation.interval}.")
-
+                    log.debug(f"task {allocation.name} is in-spec (interval {allocation.interval}).")
                     node_data["state"] = NodeState.in_spec
                     if (
-                        allocation.status == Calibration_status.FULL or allocation.status == Calibration_status.LIGHT
-                    ) and node_data["Status_check"] is not None:
+                        allocation.status in (Calibration_status.FULL, Calibration_status.LIGHT)
+                        and node_data["Status_check"] is not None
+                    ):
                         allocation.status = Calibration_status.CHECK
                         allocation.duration = timedelta(seconds=node_data["Status_check"]["Maximum_duration"])
                         allocation.parameters = [
@@ -157,26 +159,53 @@ class LocalTaskManager:
                             node_data["Status_check"]["Scanning_parameters"],
                         ]
                 else:
-                    log.warning(f"task {allocation.name} has not been done within its interval {allocation.interval}.")
-
+                    log.warning(
+                        f"task {allocation.name} exceeded its interval {allocation.interval}. "
+                        f"Last exec: {allocation.last_exec[0]}, scheduled: {allocation.last_exec[1]}. "
+                        f"Elapsed since exec: {(now - last_execution).total_seconds():.1f}s"
+                    )
                     node_data["state"] = NodeState.out_of_spec
-                    await set_treenode_status(nx.ancestors(self.G, node))
-                    log.warning(
-                        f"Last exec time: {allocation.last_exec[0]}, scheduled start_time: {allocation.last_exec[1]}."
-                    )
-                    log.warning(
-                        "Schedule-exec time difference =  "
-                        f"{(allocation.last_exec[0] - allocation.last_exec[1]).total_seconds()}, "
-                        " exec-interval time difference = "
-                        f"{(now - last_execution).total_seconds()}"
-                    )
             else:
-                log.debug(f"Task {task_name} has no active allocation.")
+                log.debug(f"Task {task_name} has no completed execution.")
                 node_data["state"] = NodeState.out_of_spec
-                await set_treenode_status(nx.ancestors(self.G, node))
 
-                log.debug("running allocation immediately")
+        # --- Pass 2: reschedule frontier out-of-spec nodes ---
+        # A node is a "frontier" when it is out_of_spec but all its parents are
+        # in_spec.  That makes it the earliest recoverable node in its chain —
+        # reschedule it and leave its descendants blocked until it succeeds.
+        for node in topo_order:
+            if node == 0:
+                continue
+            node_data = self.G.nodes[node]
+            if node_data["state"] is not NodeState.out_of_spec:
+                continue
+            if any(
+                self.G.nodes[p]["state"] is not NodeState.in_spec
+                for p in self.G.predecessors(node)
+            ):
+                continue
+
+            task_name = node_data["Name"]
+            allocation = self._scheduler.get_allocation(task_name)
+            log.debug(f"Rescheduling frontier task {task_name}.")
+            await self.report_status("agentTaskSchedulerPhase", {
+                "dag_traversal": "reschedule",
+                "task_name": task_name,
+            })
+            async with self._scheduler.lock:
                 await self._scheduler.run_immediately(allocation)
+
+        # --- Update root state from children ---
+        child_states = [
+            self.G.nodes[n]["state"]
+            for n in self.G.successors(0)
+        ]
+        if not child_states or all(s is NodeState.in_spec for s in child_states):
+            self.G.nodes[0]["state"] = NodeState.in_spec
+        elif all(s is NodeState.out_of_spec for s in child_states):
+            self.G.nodes[0]["state"] = NodeState.out_of_spec
+        else:
+            self.G.nodes[0]["state"] = NodeState.partial_out_of_spec
 
         await asyncio.sleep(self.delay)
 
