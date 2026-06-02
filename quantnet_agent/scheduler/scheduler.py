@@ -161,6 +161,9 @@ class AgentScheduler:
         allocation.last_allocation = None
 
     async def run_immediately(self, allocation):
+        if allocation is None:
+            log.warning("run_immediately called with no allocation — task not yet registered, skipping.")
+            return
         log.debug(f"Running {allocation.name} immediately")
         await self.delete_allocation(allocation)
         basetime_diff = math.ceil((datetime.now(timezone.utc) - self.base) / Constants.SLOTSIZE)
@@ -210,6 +213,9 @@ class AgentScheduler:
                 if allocation.last_allocation is None:
                     # First time this allocation is being scheduled.
                     await self.run_immediately(allocation)
+                elif shift == 0:
+                    # Window did not move — nothing to reschedule.
+                    pass
                 else:
                     log.debug(f"last timeslot = {allocation.last_allocation}")
                     allocation.last_allocation -= shift
@@ -374,11 +380,21 @@ class AgentScheduler:
         matching_allocation = next((alloc for alloc in self.remote_allocations if alloc.exp_id == exp_id), None)
         if not matching_allocation:
             log.error(f"No allocation found for exp_id {exp_id}")
-            return response_obj(
-                status=Status(Code.FAILED, value=Code.FAIELD.name, reason=f"No allocation found for exp_id {exp_id}")
-            )
+            return response_obj(status=Status(
+                code=Code.FAILED, value=Code.FAILED.name,
+                reason=f"No allocation found for exp_id {exp_id}",
+            ))
 
+        # Wait up to allocation.duration for the job to start executing, then give up.
+        # Unbounded polling would stall the RPC caller forever if the job was missed or cancelled.
+        deadline = matching_allocation.start_time + matching_allocation.duration
         while matching_allocation.last_exec is None:
+            if datetime.now(timezone.utc) > deadline:
+                log.error(f"Timed out waiting for experiment {exp_id} to start.")
+                return response_obj(status=Status(
+                    code=Code.FAILED, value=Code.FAILED.name,
+                    reason=f"Experiment {exp_id} did not start within its allocated duration",
+                ))
             await asyncio.sleep(0.1)
 
         log.debug(f"Processing result for allocation with exp_id {exp_id}")
