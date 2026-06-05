@@ -234,7 +234,16 @@ class AgentScheduler:
 
                     self.schedule_allocations(allocation)
 
-            self.remote_allocations = [i for i in self.remote_allocations if hasattr(i, "job") and i.job.pending]
+            still_pending = []
+            for alloc in self.remote_allocations:
+                if hasattr(alloc, "job") and alloc.job.pending:
+                    still_pending.append(alloc)
+                else:
+                    # Job has fired — clear its timeslot entries so future requests can use them
+                    for idx in alloc._slot_indices:
+                        if idx < len(self.timeslots) and self.timeslots[idx] is alloc:
+                            self.timeslots[idx] = None
+            self.remote_allocations = still_pending
 
     async def _handle_jobs(self):
         self.base = datetime.now(timezone.utc)
@@ -353,6 +362,8 @@ class AgentScheduler:
 
             for allocation in request.payload.allocations:
                 timeslot_indices = [i + base_diff for i in allocation.timeSlot]
+                if not timeslot_indices:
+                    continue
                 if not self._are_slots_empty(timeslot_indices):
                     log.error(f"Cannot allocate experiment {exp_id}. Slots are already occupied")
                     return response_obj(expid=exp_id, status=Status(code=6, value=Code(6).name))
