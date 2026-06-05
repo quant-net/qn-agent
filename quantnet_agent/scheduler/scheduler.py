@@ -66,6 +66,7 @@ class AgentScheduler:
         self.cmd_handler = {}
         self.cid = cid
         self.msgclient = msgclient
+        self._exp_start_times: dict = {}  # exp_id -> datetime when first block started
 
         def job_listener(event):
             # Fires on EVENT_JOB_EXECUTED and EVENT_JOB_ERROR for both local and remote jobs.
@@ -251,6 +252,8 @@ class AgentScheduler:
             )
             pub_job = self.msgclient.publish("monitor", msg.as_dict())
             allocation.last_exec = [datetime.now(timezone.utc), start_time]
+            if allocation.exp_id and allocation.exp_id not in self._exp_start_times:
+                self._exp_start_times[allocation.exp_id] = allocation.last_exec[0]
             await allocation.operation(allocation.parameters, exp_id=allocation.exp_id)
             await pub_job
 
@@ -377,25 +380,31 @@ class AgentScheduler:
         response_obj = self.cmd_handler[request.cmd][2]
         exp_id = request.payload.expid._value
 
+        # Find any pending allocation OR check if exp already started via _exp_start_times.
+        # remote_allocations only keeps pending (not-yet-fired) jobs, so completed blocks
+        # are pruned. We must also look at _exp_start_times for already-started experiments.
         matching_allocation = next((alloc for alloc in self.remote_allocations if alloc.exp_id == exp_id), None)
-        if not matching_allocation:
+
+        if exp_id not in self._exp_start_times and matching_allocation is None:
             log.error(f"No allocation found for exp_id {exp_id}")
             return response_obj(status=Status(
                 code=Code.FAILED, value=Code.FAILED.name,
                 reason=f"No allocation found for exp_id {exp_id}",
             ))
 
-        # Wait up to allocation.duration for the job to start executing, then give up.
-        # Unbounded polling would stall the RPC caller forever if the job was missed or cancelled.
-        deadline = matching_allocation.start_time + matching_allocation.duration
-        while matching_allocation.last_exec is None:
-            if datetime.now(timezone.utc) > deadline:
-                log.error(f"Timed out waiting for experiment {exp_id} to start.")
-                return response_obj(status=Status(
-                    code=Code.FAILED, value=Code.FAILED.name,
-                    reason=f"Experiment {exp_id} did not start within its allocated duration",
-                ))
-            await asyncio.sleep(0.1)
+        if exp_id not in self._exp_start_times:
+            # Experiment has not started yet — wait until its first block fires.
+            # Use the earliest pending allocation's start_time as the expected start,
+            # with a generous wall-clock deadline (start_time + 60s buffer).
+            deadline = matching_allocation.start_time + timedelta(seconds=60)
+            while exp_id not in self._exp_start_times:
+                if datetime.now(timezone.utc) > deadline:
+                    log.error(f"Timed out waiting for experiment {exp_id} to start.")
+                    return response_obj(status=Status(
+                        code=Code.FAILED, value=Code.FAILED.name,
+                        reason=f"Experiment {exp_id} did not start within its allocated duration",
+                    ))
+                await asyncio.sleep(0.1)
 
         log.debug(f"Processing result for allocation with exp_id {exp_id}")
         try:
@@ -418,6 +427,7 @@ class AgentScheduler:
                     await self.delete_allocation(allocation)
                     self._alloc_by_name.pop(allocation.name, None)
                 self.remote_allocations = [a for a in self.remote_allocations if a.exp_id != exp_id]
+                self._exp_start_times.pop(exp_id, None)
             return response_obj(status=Status(code=0, value=Code(0).name))
         except JobLookupError:
             return response_obj(status=Status(code=0, value=Code(0).name))
