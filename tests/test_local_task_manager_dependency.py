@@ -24,7 +24,7 @@ from quantnet_agent.common.calibration_status import Calibration_status
 # ---------------------------------------------------------------------------
 
 def _run(coro):
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 def _make_task(node_id, name, dependency=None):
@@ -359,9 +359,10 @@ def test_reschedule_order_with_no_allocations_respects_dependency():
 
     _run(ltm.check_state())
 
-    # run_immediately is called with None when allocation is None; count calls only.
+    # run_immediately is mocked here, so the null-guard inside the real implementation
+    # is not exercised by this test — what is verified is that Pass 2 calls it exactly
+    # once (for TaskA, the frontier) and does not call it for TaskB (blocked by TaskA).
     call_count = sched.run_immediately.await_count
-    # Only TaskA (the frontier) should be rescheduled — exactly one call.
     assert call_count == 1, (
         f"Expected exactly 1 run_immediately call (TaskA only), got {call_count}"
     )

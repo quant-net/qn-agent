@@ -121,7 +121,6 @@ class LocalTaskManager:
                 node_data["state"] = NodeState.in_spec
                 if "prev_state" not in node_data:
                     node_data["prev_state"] = NodeState.out_of_spec
-                await asyncio.sleep(self.delay)
                 continue
 
             # If any direct predecessor is not in_spec, inherit that failure.
@@ -195,14 +194,13 @@ class LocalTaskManager:
             async with self._scheduler.lock:
                 await self._scheduler.run_immediately(allocation)
 
-        # --- Update root state from children ---
-        child_states = [
-            self.G.nodes[n]["state"]
-            for n in self.G.successors(0)
-        ]
-        if not child_states or all(s is NodeState.in_spec for s in child_states):
+        # --- Update root state from all non-root nodes ---
+        # Using the full topo_order (not just direct children) means a failure
+        # anywhere in the tree — not only at depth 1 — is reflected on root.
+        all_states = [self.G.nodes[n]["state"] for n in topo_order if n != 0]
+        if not all_states or all(s is NodeState.in_spec for s in all_states):
             self.G.nodes[0]["state"] = NodeState.in_spec
-        elif all(s is NodeState.out_of_spec for s in child_states):
+        elif all(s is NodeState.out_of_spec for s in all_states):
             self.G.nodes[0]["state"] = NodeState.out_of_spec
         else:
             self.G.nodes[0]["state"] = NodeState.partial_out_of_spec

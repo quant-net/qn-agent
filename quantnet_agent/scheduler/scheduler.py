@@ -243,6 +243,7 @@ class AgentScheduler:
                     for idx in alloc._slot_indices:
                         if idx < len(self.timeslots) and self.timeslots[idx] is alloc:
                             self.timeslots[idx] = None
+                    self._alloc_by_name.pop(alloc.name, None)
             self.remote_allocations = still_pending
 
     async def _handle_jobs(self):
