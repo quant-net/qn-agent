@@ -47,11 +47,12 @@ def _make_task(node_id, name, dependency=None):
     }
 
 
-def _make_allocation(name, last_exec_offset=None, interval=timedelta(seconds=300)):
+def _make_allocation(name, last_exec_offset=None, interval=timedelta(seconds=300), failed=False):
     alloc = MagicMock(spec=Allocation)
     alloc.name = name
     alloc.interval = interval
     alloc.status = Calibration_status.FULL
+    alloc.failed = failed
     alloc.job_ids = []
     if last_exec_offset is not None:
         now = datetime.now(timezone.utc)
@@ -366,3 +367,31 @@ def test_reschedule_order_with_no_allocations_respects_dependency():
     assert call_count == 1, (
         f"Expected exactly 1 run_immediately call (TaskA only), got {call_count}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Test 8 – HAL: misconfigured driver raises RuntimeError at construction
+# ---------------------------------------------------------------------------
+
+def test_hal_raises_on_unknown_driver():
+    """
+    HardwareAbstractionLayer must raise RuntimeError when an enabled device's
+    driver class cannot be found, rather than silently continuing.
+    """
+    import pytest
+    from quantnet_agent.hal.HAL import HardwareAbstractionLayer
+    from unittest.mock import MagicMock
+
+    config = MagicMock()
+    config.devices = {
+        "exp_framework": {
+            "enabled": "true",
+            "driver": "NonExistentDriverXYZ",
+        }
+    }
+    config.node_file = ""
+    config.mq_broker_host = "localhost"
+    config.mq_broker_port = 1883
+
+    with pytest.raises(RuntimeError, match="exp_framework"):
+        HardwareAbstractionLayer(config, msgclient=MagicMock())
