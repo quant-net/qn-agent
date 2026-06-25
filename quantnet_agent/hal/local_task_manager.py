@@ -73,6 +73,7 @@ class LocalTaskManager:
         self.is_started = False
         self._msgclient = msgclient
         self.delay = delay
+        self._prev_rescheduled: set = set()  # task names currently reported as "reschedule" to avoid spam
 
     @property
     def status(self):
@@ -132,19 +133,17 @@ class LocalTaskManager:
                 continue
 
             task_name = node_data["Name"]
-            await self.report_status("agentTaskSchedulerPhase", {
-                "dag_traversal": "inspect",
-                "task_name": task_name,
-                "state": node_data["state"].value,
-            })
-
             allocation = self._scheduler.get_allocation(task_name)
 
             if allocation is not None and allocation.last_exec is not None:
                 last_execution = allocation.last_exec[0]
-                if last_execution + allocation.interval > now:
+                if allocation.failed:
+                    log.warning(f"task {allocation.name} failed on last execution, marking out-of-spec.")
+                    node_data["state"] = NodeState.out_of_spec
+                elif last_execution + allocation.interval > now:
                     log.debug(f"task {allocation.name} is in-spec (interval {allocation.interval}).")
                     node_data["state"] = NodeState.in_spec
+                    self._prev_rescheduled.discard(task_name)
                     if (
                         allocation.status in (Calibration_status.FULL, Calibration_status.LIGHT)
                         and node_data["Status_check"] is not None
@@ -168,6 +167,15 @@ class LocalTaskManager:
                 log.debug(f"Task {task_name} has no completed execution.")
                 node_data["state"] = NodeState.out_of_spec
 
+            # Only publish when the state actually changed (avoid per-second spam).
+            if node_data["state"] != node_data.get("prev_state"):
+                await self.report_status("agentTaskSchedulerPhase", {
+                    "dag_traversal": "inspect",
+                    "task_name": task_name,
+                    "state": node_data["state"].value,
+                })
+                node_data["prev_state"] = node_data["state"]
+
         # --- Pass 2: reschedule frontier out-of-spec nodes ---
         # A node is a "frontier" when it is out_of_spec but all its parents are
         # in_spec.  That makes it the earliest recoverable node in its chain —
@@ -187,10 +195,12 @@ class LocalTaskManager:
             task_name = node_data["Name"]
             allocation = self._scheduler.get_allocation(task_name)
             log.debug(f"Rescheduling frontier task {task_name}.")
-            await self.report_status("agentTaskSchedulerPhase", {
-                "dag_traversal": "reschedule",
-                "task_name": task_name,
-            })
+            if task_name not in self._prev_rescheduled:
+                await self.report_status("agentTaskSchedulerPhase", {
+                    "dag_traversal": "reschedule",
+                    "task_name": task_name,
+                })
+                self._prev_rescheduled.add(task_name)
             async with self._scheduler.lock:
                 await self._scheduler.run_immediately(allocation)
 

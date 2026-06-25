@@ -43,6 +43,7 @@ class Allocation:
         self.result_handler = result_handler
         self.status = status
         self.checking_param = checking_param if checking_param is not None else []
+        self.failed = False
         self.job_ids = []
         self._slot_indices: set = set()
 
@@ -74,7 +75,11 @@ class AgentScheduler:
             if allocation is None:
                 return
             if event.exception:
-                log.error(f"Job {event.job_id} for allocation {allocation.name} failed.")
+                allocation.failed = True
+                log.error(
+                    f"Job {event.job_id} for allocation {allocation.name} failed: "
+                    f"{event.exception}\n{event.traceback}"
+                )
             else:
                 log.debug(f"Job {event.job_id} for allocation {allocation.name} executed successfully.")
                 # TODO: wait for result, then decide between LIGHT and FULL re-calibration based on the check.
@@ -261,11 +266,14 @@ class AgentScheduler:
                 value=f"Running task {allocation.name} at {start_time}",
             )
             pub_job = self.msgclient.publish("monitor", msg.as_dict())
+            allocation.failed = False
             allocation.last_exec = [datetime.now(timezone.utc), start_time]
             if allocation.exp_id and allocation.exp_id not in self._exp_start_times:
                 self._exp_start_times[allocation.exp_id] = allocation.last_exec[0]
-            await allocation.operation(allocation.parameters, exp_id=allocation.exp_id)
-            await pub_job
+            try:
+                await allocation.operation(allocation.parameters, exp_id=allocation.exp_id)
+            finally:
+                await pub_job
 
         log.debug(f"Trying to allocate {allocation.name} to {indices}")
         for index in indices:

@@ -395,3 +395,100 @@ def test_hal_raises_on_unknown_driver():
 
     with pytest.raises(RuntimeError, match="exp_framework"):
         HardwareAbstractionLayer(config, msgclient=MagicMock())
+
+
+# ---------------------------------------------------------------------------
+# Test 9 – failed flag: a recently-executed but failed task is immediately
+#           marked out-of-spec and rescheduled on the next cycle
+# ---------------------------------------------------------------------------
+
+def test_failed_allocation_marked_out_of_spec_immediately():
+    """
+    When an allocation's .failed flag is True, check_state must treat the
+    task as out-of-spec regardless of the interval (i.e. even if it ran very
+    recently). Pass 2 should then reschedule it as the frontier node.
+    """
+    sched, client = _make_mocks()
+    # Task ran 5 seconds ago (well within the 300s interval) but failed.
+    alloc = _make_allocation("TaskA", last_exec_offset=timedelta(seconds=-5), failed=True)
+    sched.get_allocation.side_effect = lambda name: alloc if name == "TaskA" else None
+
+    ltm = _make_ltm(sched, client)
+    _add_tasks(ltm, [_make_task("a", "TaskA", dependency=None)])
+
+    _run(ltm.check_state())
+
+    # Despite a fresh last_exec, the task must be rescheduled because it failed.
+    sched.run_immediately.assert_awaited_once_with(alloc)
+
+
+# ---------------------------------------------------------------------------
+# Test 10 – two-cycle scenario: failed parent rescheduled first; child
+#            rescheduled only after parent recovers
+# ---------------------------------------------------------------------------
+
+def test_failed_parent_rescheduled_before_child_then_child_runs_after_recovery():
+    """
+    A → B chain.  A ran 5 s ago but failed (failed=True); B's interval is exceeded.
+
+    Cycle 1 (A failed):
+      - A is out-of-spec (failed flag overrides the recent last_exec).
+      - A is the frontier → run_immediately(A) is called.
+      - B's parent (A) is out-of-spec → B inherits out-of-spec and is NOT scheduled.
+
+    Simulate A's successful retry: clear failed, refresh last_exec to now.
+
+    Cycle 2 (A recovered):
+      - A is now in-spec.
+      - B's interval is still exceeded → B becomes the frontier.
+      - run_immediately(B) is called; A is not rescheduled.
+    """
+    sched, client = _make_mocks()
+
+    # A failed 5 s ago — within interval but failed=True.
+    a_alloc = _make_allocation("TaskA", last_exec_offset=timedelta(seconds=-5), failed=True)
+    # B's interval is exceeded (ran 350 s ago, interval=300 s).
+    b_alloc = _make_allocation("TaskB", last_exec_offset=timedelta(seconds=-350))
+
+    sched.get_allocation.side_effect = lambda name: {
+        "TaskA": a_alloc,
+        "TaskB": b_alloc,
+    }.get(name)
+
+    ltm = _make_ltm(sched, client)
+    _add_tasks(ltm, [
+        _make_task("a", "TaskA", dependency=None),
+        _make_task("b", "TaskB", dependency=["a"]),
+    ])
+
+    # --- Cycle 1 ---
+    _run(ltm.check_state())
+
+    scheduled_cycle1 = [
+        c.args[0].name for c in sched.run_immediately.await_args_list if c.args
+    ]
+    assert "TaskA" in scheduled_cycle1, (
+        "A (failed) must be rescheduled in cycle 1"
+    )
+    assert "TaskB" not in scheduled_cycle1, (
+        "B must be blocked while its parent A is out-of-spec"
+    )
+
+    # Simulate A's successful retry.
+    sched.run_immediately.reset_mock()
+    a_alloc.failed = False
+    now = datetime.now(timezone.utc)
+    a_alloc.last_exec = [now, now]
+
+    # --- Cycle 2 ---
+    _run(ltm.check_state())
+
+    scheduled_cycle2 = [
+        c.args[0].name for c in sched.run_immediately.await_args_list if c.args
+    ]
+    assert "TaskA" not in scheduled_cycle2, (
+        "A is now in-spec; must not be rescheduled in cycle 2"
+    )
+    assert "TaskB" in scheduled_cycle2, (
+        "B must be rescheduled now that parent A is in-spec"
+    )
