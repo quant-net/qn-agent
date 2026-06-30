@@ -64,6 +64,17 @@ class HardwareAbstractionLayer:
                 continue
             self.devs[device] = dev
 
+        failed = [
+            name for name, prop in config.devices.items()
+            if TypeAdapter(bool).validate_python(prop.get("enabled", True))
+            and name not in self.devs
+        ]
+        if failed:
+            raise RuntimeError(
+                f"Failed to load required device driver(s): {', '.join(failed)}. "
+                f"Check the 'driver' class names in agent.cfg [devices] section."
+            )
+
 
 class Interpreter(ABC):
     """Abstract base class for the Agent Interpreter module.
