@@ -36,10 +36,10 @@ class QuantnetAgent:
         self._repl = None
 
     async def handle_exit(self, sig: int, frame: Optional[FrameType]) -> None:
-        if self.should_exit and sig == signal.SIGINT:
+        if self.should_exit:
             self.force_exit = True
-        else:
-            self.should_exit = True
+            return
+        self.should_exit = True
         await self._sreg.stop()
         if hasattr(self, "_link_mgr") and self._link_mgr is not None:
             await self._link_mgr.stop()
@@ -56,7 +56,7 @@ class QuantnetAgent:
         try:
             for signame in ("SIGINT", "SIGTERM"):
                 sig = getattr(signal, signame)
-                loop.add_signal_handler(sig, lambda signame=signame: asyncio.create_task(self.handle_exit(sig, None)))
+                loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.handle_exit(s, None)))
         except NotImplementedError:
             return
 

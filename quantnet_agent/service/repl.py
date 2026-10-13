@@ -3,8 +3,12 @@ import ctypes
 import ctypes.util
 import curses
 import logging
+import os
 import readline
+import signal
 import sys
+import threading
+import time
 from datetime import datetime
 
 from quantnet_agent.hal.link_state_table import (
@@ -96,6 +100,8 @@ class AgentREPL:
         self._logging_console_enabled = False  # Hide logging by default (like iOS)
         self._node_name = cid.split(":")[-2] if ":" in cid else cid
         self._repl_handler = None
+        self._stop_event = threading.Event()  # set to unblock input() on shutdown
+        self._last_sigint_time: float = 0.0   # timestamp of last Ctrl+C for double-Ctrl+C detection
 
     def _setup_readline(self):
         neighbor_cids = list(self._table.all().keys())
@@ -142,33 +148,96 @@ class AgentREPL:
         self._repl_handler = None
         self._original_handlers = []
 
+    # Sentinel values returned by _read_line to distinguish outcomes
+    _EOF = object()       # Ctrl+D on empty line → exit cleanly
+    _INTERRUPT = object()  # Ctrl+C → cancel current input, stay alive
+
+    def _read_line(self):
+        """Read one line from stdin in a background thread.
+
+        Returns:
+            str        — the line the user typed
+            _EOF       — Ctrl+D on an empty line (clean exit)
+            _INTERRUPT — Ctrl+C (cancel current input, stay alive)
+            None       — _stop_event was set externally (agent shutdown)
+        """
+        result = [None]
+        done = threading.Event()
+
+        def _reader():
+            try:
+                result[0] = input(self._prompt())
+            except EOFError:
+                result[0] = AgentREPL._EOF
+            except KeyboardInterrupt:
+                result[0] = AgentREPL._INTERRUPT
+            finally:
+                done.set()
+
+        t = threading.Thread(target=_reader, daemon=True)
+        t.start()
+
+        while not done.is_set():
+            if self._stop_event.is_set():
+                # Agent is shutting down — unblock input() with a newline
+                try:
+                    os.write(sys.stdin.fileno(), b"\n")
+                except OSError:
+                    pass
+                done.wait(timeout=1.0)
+                break
+            done.wait(timeout=0.1)
+
+        return result[0]
+
+    def stop(self):
+        """Unblock the input loop on external shutdown (e.g. SIGTERM from another source)."""
+        self._stop_event.set()
+
     async def start(self):
         from quantnet_agent.common.logging import clear_buffered_logs
         self._setup_readline()
         self._install_log_handler()
-        # Clear pre-REPL logs so 'show logging' only shows REPL-era activity
         clear_buffered_logs()
         loop = asyncio.get_event_loop()
         print("\nAgent ready. Type 'help' for commands.\n")
+
         try:
-            while True:
-                try:
-                    self._repl_handler.waiting = True
-                    line = await loop.run_in_executor(
-                        None, lambda: input(self._prompt())
-                    )
-                    self._repl_handler.waiting = False
-                except (EOFError, KeyboardInterrupt):
-                    self._repl_handler.waiting = False
+            while not self._stop_event.is_set():
+                self._repl_handler.waiting = True
+                result = await loop.run_in_executor(None, self._read_line)
+                self._repl_handler.waiting = False
+
+                if result is None:
+                    # External shutdown (stop_event set by handle_exit)
+                    break
+
+                if result is AgentREPL._INTERRUPT:
+                    # Ctrl+C: cancel current input and stay alive, like every other REPL.
+                    # Second Ctrl+C within 1 second: force-exit immediately.
+                    now = time.monotonic()
+                    if now - self._last_sigint_time < 1.0:
+                        print("\nForce exit.")
+                        os.kill(os.getpid(), signal.SIGKILL)
+                    self._last_sigint_time = now
+                    print("^C")
+                    continue
+
+                if result is AgentREPL._EOF:
+                    # Ctrl+D on an empty line: clean exit with deregister
                     print()
                     break
-                line = line.strip()
+
+                line = result.strip()
                 if not line:
                     continue
                 if await self._dispatch(line):
-                    break  # exit/quit
+                    break  # exit/quit command
         finally:
             self._uninstall_log_handler()
+            # Send SIGTERM so handle_exit runs deregister and main_loop exits.
+            # Safe even if already shutting down — handle_exit is idempotent.
+            os.kill(os.getpid(), signal.SIGTERM)
 
     async def _dispatch(self, line: str) -> bool:
         parts = line.split()
