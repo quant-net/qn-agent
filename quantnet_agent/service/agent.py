@@ -2,6 +2,7 @@ import asyncio
 import os
 import signal
 import logging
+import threading
 import uvloop
 import importlib
 import json
@@ -34,11 +35,11 @@ class QuantnetAgent:
         self._link_state_table = None
         self._link_mgr = None
         self._repl = None
+        self._startup_done = threading.Event()  # signals main thread when startup is complete
 
     async def handle_exit(self, sig: int, frame: Optional[FrameType]) -> None:
         if self.should_exit:
-            self.force_exit = True
-            return
+            return  # idempotent — REPL sends SIGTERM; handle_exit may fire twice
         self.should_exit = True
         await self._sreg.stop()
         if hasattr(self, "_link_mgr") and self._link_mgr is not None:
@@ -46,20 +47,65 @@ class QuantnetAgent:
 
     def run(self) -> None:
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-        return asyncio.run(self.serve())
 
-    async def serve(self) -> None:
+        if self.config.no_repl:
+            # No REPL: run event loop in the main thread as before.
+            # SIGINT and SIGTERM both trigger clean shutdown.
+            asyncio.run(self._serve_no_repl())
+            return
+
+        # With REPL: event loop runs in a background thread; REPL owns the main thread.
+        # add_signal_handler() requires the main thread, so we use signal.signal()
+        # here and bridge into the event loop with call_soon_threadsafe.
+        loop = uvloop.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        def _sigterm_handler(sig, frame):
+            loop.call_soon_threadsafe(
+                lambda: asyncio.ensure_future(self.handle_exit(sig, frame), loop=loop)
+            )
+
+        signal.signal(signal.SIGTERM, _sigterm_handler)
+
+        loop_thread = threading.Thread(
+            target=loop.run_until_complete,
+            args=(self.serve(),),
+            daemon=True,
+            name="agent-event-loop",
+        )
+        loop_thread.start()
+
+        # Wait for startup to complete before handing control to the REPL
+        self._startup_done.wait()
+
+        if self._repl is not None:
+            self._repl.run_sync(loop)
+
+        loop_thread.join()
+
+    async def _serve_no_repl(self) -> None:
         process_id = os.getpid()
-
-        # install signal handlers
         loop = asyncio.get_event_loop()
         try:
             for signame in ("SIGINT", "SIGTERM"):
                 sig = getattr(signal, signame)
-                loop.add_signal_handler(sig, lambda s=sig: asyncio.create_task(self.handle_exit(s, None)))
+                loop.add_signal_handler(
+                    sig, lambda s=sig: asyncio.create_task(self.handle_exit(s, None))
+                )
         except NotImplementedError:
             return
+        log.info(f"Started agent process [{process_id}]")
+        await self.startup()
+        if self.should_exit:
+            return
+        await self.main_loop()
+        await self.shutdown()
+        log.info(f"Finished agent process [{process_id}]")
 
+    async def serve(self) -> None:
+        process_id = os.getpid()
+        # SIGTERM is wired in run() via signal.signal() in the main thread
+        # (add_signal_handler requires the main thread and can't be used here).
         log.info(f"Started agent process [{process_id}]")
 
         await self.startup()
@@ -117,10 +163,12 @@ class QuantnetAgent:
         await self.node.start()
         self.started = True
 
-        # Start interactive REPL (unless --no-repl)
+        # Build REPL object so main thread can call run_sync() after startup_done is set.
         if not self.config.no_repl:
             self._repl = AgentREPL(self.config.cid, self._link_mgr, self._link_state_table, config=self.config)
-            await self._repl.start()
+
+        # Signal main thread that startup is complete
+        self._startup_done.set()
 
     async def main_loop(self) -> None:
         counter = 0

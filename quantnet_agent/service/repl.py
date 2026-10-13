@@ -7,7 +7,6 @@ import os
 import readline
 import signal
 import sys
-import threading
 import time
 from datetime import datetime
 
@@ -100,8 +99,8 @@ class AgentREPL:
         self._logging_console_enabled = False  # Hide logging by default (like iOS)
         self._node_name = cid.split(":")[-2] if ":" in cid else cid
         self._repl_handler = None
-        self._stop_event = threading.Event()  # set to unblock input() on shutdown
-        self._last_sigint_time: float = 0.0   # timestamp of last Ctrl+C for double-Ctrl+C detection
+        self._last_sigint_time: float = 0.0  # for double-Ctrl+C detection
+        self._loop: asyncio.AbstractEventLoop | None = None  # event loop running in bg thread
 
     def _setup_readline(self):
         neighbor_cids = list(self._table.all().keys())
@@ -148,73 +147,36 @@ class AgentREPL:
         self._repl_handler = None
         self._original_handlers = []
 
-    # Sentinel values returned by _read_line to distinguish outcomes
-    _EOF = object()       # Ctrl+D on empty line → exit cleanly
-    _INTERRUPT = object()  # Ctrl+C → cancel current input, stay alive
+    def _run_async(self, coro):
+        """Run a coroutine on the background event loop and block until done."""
+        return asyncio.run_coroutine_threadsafe(coro, self._loop).result(timeout=30)
 
-    def _read_line(self):
-        """Read one line from stdin in a background thread.
+    def run_sync(self, loop: asyncio.AbstractEventLoop, on_shutdown=None):
+        """Blocking REPL loop. Must be called from the main thread.
 
-        Returns:
-            str        — the line the user typed
-            _EOF       — Ctrl+D on an empty line (clean exit)
-            _INTERRUPT — Ctrl+C (cancel current input, stay alive)
-            None       — _stop_event was set externally (agent shutdown)
+        The event loop runs in a background thread (started by the agent).
+        Async commands are dispatched to that loop via run_coroutine_threadsafe.
+
+        Args:
+            loop: the running event loop in the background thread
+            on_shutdown: optional callable invoked after the REPL exits
         """
-        result = [None]
-        done = threading.Event()
-
-        def _reader():
-            try:
-                result[0] = input(self._prompt())
-            except EOFError:
-                result[0] = AgentREPL._EOF
-            except KeyboardInterrupt:
-                result[0] = AgentREPL._INTERRUPT
-            finally:
-                done.set()
-
-        t = threading.Thread(target=_reader, daemon=True)
-        t.start()
-
-        while not done.is_set():
-            if self._stop_event.is_set():
-                # Agent is shutting down — unblock input() with a newline
-                try:
-                    os.write(sys.stdin.fileno(), b"\n")
-                except OSError:
-                    pass
-                done.wait(timeout=1.0)
-                break
-            done.wait(timeout=0.1)
-
-        return result[0]
-
-    def stop(self):
-        """Unblock the input loop on external shutdown (e.g. SIGTERM from another source)."""
-        self._stop_event.set()
-
-    async def start(self):
         from quantnet_agent.common.logging import clear_buffered_logs
+        self._loop = loop
         self._setup_readline()
         self._install_log_handler()
         clear_buffered_logs()
-        loop = asyncio.get_event_loop()
         print("\nAgent ready. Type 'help' for commands.\n")
 
         try:
-            while not self._stop_event.is_set():
-                self._repl_handler.waiting = True
-                result = await loop.run_in_executor(None, self._read_line)
-                self._repl_handler.waiting = False
-
-                if result is None:
-                    # External shutdown (stop_event set by handle_exit)
-                    break
-
-                if result is AgentREPL._INTERRUPT:
-                    # Ctrl+C: cancel current input and stay alive, like every other REPL.
-                    # Second Ctrl+C within 1 second: force-exit immediately.
+            while True:
+                try:
+                    self._repl_handler.waiting = True
+                    line = input(self._prompt())
+                    self._repl_handler.waiting = False
+                except KeyboardInterrupt:
+                    # Ctrl+C: cancel this input, stay alive.
+                    self._repl_handler.waiting = False
                     now = time.monotonic()
                     if now - self._last_sigint_time < 1.0:
                         print("\nForce exit.")
@@ -222,24 +184,25 @@ class AgentREPL:
                     self._last_sigint_time = now
                     print("^C")
                     continue
-
-                if result is AgentREPL._EOF:
-                    # Ctrl+D on an empty line: clean exit with deregister
+                except EOFError:
+                    # Ctrl+D: clean shutdown
+                    self._repl_handler.waiting = False
                     print()
                     break
 
-                line = result.strip()
+                line = line.strip()
                 if not line:
                     continue
-                if await self._dispatch(line):
-                    break  # exit/quit command
+                if self._dispatch(line):
+                    break  # exit/quit
         finally:
             self._uninstall_log_handler()
-            # Send SIGTERM so handle_exit runs deregister and main_loop exits.
-            # Safe even if already shutting down — handle_exit is idempotent.
+            if on_shutdown:
+                on_shutdown()
+            # Send SIGTERM so agent's handle_exit runs deregister and loop exits.
             os.kill(os.getpid(), signal.SIGTERM)
 
-    async def _dispatch(self, line: str) -> bool:
+    def _dispatch(self, line: str) -> bool:
         parts = line.split()
         if not parts:
             return False
@@ -260,15 +223,15 @@ class AgentREPL:
             elif args[0] == "config":
                 self._cmd_show_config()
             elif args[0] == "switch-check" and len(args) >= 2:
-                await self._cmd_link_switch_check(args[1])
+                self._run_async(self._cmd_link_switch_check(args[1]))
             else:
                 print(f"Unknown show target: {args[0]}")
         elif cmd == "connect" and args:
-            await self._cmd_link_connect(args[0])
+            self._run_async(self._cmd_link_connect(args[0]))
         elif cmd == "disconnect" and args:
-            await self._cmd_link_disconnect(args[0])
+            self._run_async(self._cmd_link_disconnect(args[0]))
         elif cmd == "probe" and args:
-            await self._cmd_link_probe(args[0])
+            self._run_async(self._cmd_link_probe(args[0]))
         elif cmd == "set" and len(args) >= 2:
             self._cmd_link_set(args[0], args[1])
         elif cmd == "debug" and args and args[0] == "link":
