@@ -87,10 +87,11 @@ class REPLLogHandler(logging.Handler):
 
 
 class AgentREPL:
-    def __init__(self, cid: str, link_mgr, link_state_table):
+    def __init__(self, cid: str, link_mgr, link_state_table, config=None):
         self._cid = cid
         self._link_mgr = link_mgr
         self._table = link_state_table
+        self._config = config
         self._debug = False
         self._logging_console_enabled = False  # Hide logging by default (like iOS)
         self._node_name = cid.split(":")[-2] if ":" in cid else cid
@@ -381,6 +382,8 @@ class AgentREPL:
 
                 # Channels
                 channels = node_config.get("channels", [])
+                for iface in node_config.get("matterLightInterfaceSettings", []):
+                    channels = channels + iface.get("channels", [])
                 if channels:
                     print(f"\nChannels ({len(channels)} total):")
                     print("  " + "-" * 56)

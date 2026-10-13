@@ -119,7 +119,7 @@ class QuantnetAgent:
 
         # Start interactive REPL (unless --no-repl)
         if not self.config.no_repl:
-            self._repl = AgentREPL(self.config.cid, self._link_mgr, self._link_state_table)
+            self._repl = AgentREPL(self.config.cid, self._link_mgr, self._link_state_table, config=self.config)
             await self._repl.start()
 
     async def main_loop(self) -> None:
