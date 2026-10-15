@@ -26,9 +26,74 @@ COMMANDS = [
 ]
 
 
-def _make_completer(neighbor_cids, commands):
+def _make_completer(table):
+    """Build a context-aware completer that uses the full line buffer."""
+    # Top-level commands (first word)
+    top_cmds = [
+        "show", "connect", "disconnect", "probe", "set",
+        "debug", "no", "logging", "monitor", "help", "exit", "quit",
+    ]
+    # Subcommand trees
+    show_subs = ["link", "logging", "config", "switch-check"]
+    set_subs = ["hello-interval", "hold-time"]
+    no_subs = ["debug", "logging"]
+
+    def _link_keys():
+        return list(table.all().keys())
+
+    def _match(candidates, prefix):
+        return [c for c in candidates if c.startswith(prefix)]
+
     def completer(text, state):
-        options = [c for c in commands + neighbor_cids if c.startswith(text)]
+        buf = readline.get_line_buffer().lstrip()
+        parts = buf.split()
+        # If buffer ends with space, we're completing the next word
+        completing_new = buf.endswith(" ") and buf != ""
+        n = len(parts) + (1 if completing_new else 0)
+        word = text  # current word fragment
+
+        if n <= 1:
+            # First word: top-level commands
+            options = _match(top_cmds, word)
+        elif parts[0] == "show":
+            if n == 2:
+                options = _match(show_subs, word)
+            elif n == 3 and parts[1] in ("link", "switch-check"):
+                options = _match(_link_keys(), word)
+            else:
+                options = []
+        elif parts[0] in ("connect", "disconnect", "probe"):
+            if n == 2:
+                options = _match(_link_keys(), word)
+            else:
+                options = []
+        elif parts[0] == "set":
+            if n == 2:
+                options = _match(set_subs, word)
+            else:
+                options = []
+        elif parts[0] == "debug":
+            if n == 2:
+                options = _match(["link"], word)
+            else:
+                options = []
+        elif parts[0] == "logging":
+            if n == 2:
+                options = _match(["console"], word)
+            else:
+                options = []
+        elif parts[0] == "no":
+            if n == 2:
+                options = _match(no_subs, word)
+            elif n == 3 and parts[1] == "debug":
+                options = _match(["link"], word)
+            elif n == 3 and parts[1] == "logging":
+                options = _match(["console"], word)
+            else:
+                options = []
+        else:
+            options = []
+
         return options[state] if state < len(options) else None
     return completer
 
@@ -103,11 +168,15 @@ class AgentREPL:
         self._loop: asyncio.AbstractEventLoop | None = None  # event loop running in bg thread
 
     def _setup_readline(self):
-        neighbor_cids = list(self._table.all().keys())
-        readline.set_completer(
-            _make_completer(neighbor_cids, COMMANDS)
-        )
-        readline.parse_and_bind("tab: complete")
+        readline.set_completer(_make_completer(self._table))
+        # Include ':' and '-' in word breaks so tokens like LBNL-SWITCH:1 and
+        # hello-interval are treated as single completable words
+        readline.set_completer_delims(" \t\n")
+        # libedit (macOS) uses different binding syntax than GNU readline
+        if "libedit" in (readline.__doc__ or ""):
+            readline.parse_and_bind("bind ^I rl_complete")
+        else:
+            readline.parse_and_bind("tab: complete")
 
     def _prompt(self):
         return f"quantnet-agent [{self._node_name}]> "
