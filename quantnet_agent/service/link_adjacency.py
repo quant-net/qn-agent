@@ -270,8 +270,8 @@ class LinkAdjacencyManager:
 
     async def _hello_loop(self) -> None:
         while self.is_started:
-            for key in list(self._table.all().keys()):
-                await self._send_hello(key)
+            keys = list(self._table.all().keys())
+            await asyncio.gather(*(self._send_hello(k) for k in keys))
             self._check_hold_timers()
             await self._probe_if_ready()
             self._publish_pending_updates()
