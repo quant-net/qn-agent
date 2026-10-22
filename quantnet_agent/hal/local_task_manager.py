@@ -78,7 +78,7 @@ class LocalTaskManager:
     @property
     def status(self):
         log.debug("Checking root node status in DAG")
-        return self.G.nodes(0)["state"]
+        return self.G.nodes[0]["state"]
 
     async def start(self):
         self.add_dependency()
@@ -92,7 +92,7 @@ class LocalTaskManager:
         log.info("Periodically checking state of DAG node")
         while self.is_started:
             await self.check_state()
-            current_state = self.G.nodes()[0]["state"]
+            current_state = self.G.nodes[0]["state"]
             if current_state != prev_state:
                 await self.report_status("agentState", current_state.value)
                 prev_state = current_state

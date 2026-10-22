@@ -38,6 +38,7 @@ class Config:
         mq_broker_port: int = None,
         interpreter_path: str = None,
         schema_path: str = None,
+        no_repl: bool = False,
     ):
         self.config_file = find_config_file(config_file)
 
@@ -51,6 +52,13 @@ class Config:
         self.node_file = self._resolve(node_file, "agent", "node_file", None)
         self.mq_broker_host = self._resolve(mq_broker_host, "mq", "host", "127.0.0.1")
         self.mq_broker_port = self._resolve(mq_broker_port, "mq", "port", "1883")
+
+        self.link_hello_interval = int(
+            self._resolve(None, "link", "hello_interval", str(Constants.DEFAULT_LINK_HELLO_INTERVAL))
+        )
+        self.link_hold_time = int(
+            self._resolve(None, "link", "hold_time", str(Constants.DEFAULT_LINK_HOLD_TIME))
+        )
 
         self.threads = int(self._resolve(None, "agent", "threads", 8))
         self.debug = self._resolve(debug if debug else None, "agent", "debug", False)
@@ -66,6 +74,7 @@ class Config:
             self.proto_plugins = {}
 
         self.schema_path = self._resolve(schema_path, "schemas", "path", None)
+        self.no_repl = no_repl
 
         self.devices = self._parser.get("devices", {}) if self._parser else {}
 

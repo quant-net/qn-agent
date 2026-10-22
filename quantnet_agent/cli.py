@@ -31,8 +31,19 @@ log = logging.getLogger(__name__)
     help="Specify a path containing additional schema files",
     show_default=True,
 )
-def main(config, agent_id, node_config, mq_broker_host, mq_broker_port, debug, interpreter_path, schema_path):
-    cobj = Config(config, node_config, debug, agent_id, mq_broker_host, mq_broker_port, interpreter_path, schema_path)
+@click.option(
+    "--no-repl",
+    "no_repl",
+    is_flag=True,
+    default=False,
+    help="Run headless without interactive REPL (default for Docker)",
+    show_default=True,
+)
+def main(config, agent_id, node_config, mq_broker_host, mq_broker_port, debug, interpreter_path, schema_path, no_repl):
+    cobj = Config(
+        config, node_config, debug, agent_id, mq_broker_host, mq_broker_port,
+        interpreter_path, schema_path, no_repl=no_repl,
+    )
 
     setup_logging(cobj)
 

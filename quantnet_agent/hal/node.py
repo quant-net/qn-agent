@@ -162,6 +162,9 @@ class Node(ABC):
 
     async def start(self):
         await self._rpcserver.start()
+        # Subscribe to the link adjacency topic so agent-to-agent link
+        # traffic (hello, probe, control) bypasses the controller's rpc/+ wildcard.
+        self._rpcserver.subscribe(f"{Constants.LINK_TOPIC_PREFIX}/{self._cid}")
         await self.local_task_manager.start()
 
 

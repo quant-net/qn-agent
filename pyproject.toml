@@ -33,3 +33,4 @@ include = ["quantnet_agent", "quantnet_agent.*"]
 
 [project.scripts]
 quantnet_agent = "quantnet_agent.cli:main"
+quantnet_repl = "quantnet_agent.service.remote_repl:main"
